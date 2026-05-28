@@ -1,0 +1,8 @@
+.env
+.env.local
+.codex_deps/
+data/
+__pycache__/
+*.pyc
+*.db
+*.sqlite3
