@@ -9,6 +9,7 @@ LINE group bot that suggests healthy but satisfying dinner menus for two people.
 - Manages ingredients and quantities
 - Reads receipt images and asks before adding detected ingredients
 - Updates inventory after the user confirms the meal was cooked
+- Handles manual inventory changes such as used, discarded, and corrected ingredients
 
 ## Environment variables
 

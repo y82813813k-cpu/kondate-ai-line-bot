@@ -342,6 +342,26 @@ def add_inventory_items(items: list[dict[str, str]]) -> list[dict[str, str]]:
     return added
 
 
+def add_meal_history_entry(
+    conversation_id: str,
+    title: str,
+    details: dict[str, Any],
+) -> None:
+    state = load_state()
+    state["counters"]["meal_history"] += 1
+    state["meal_history"].append(
+        {
+            "id": state["counters"]["meal_history"],
+            "conversation_id": conversation_id,
+            "meal_date": datetime.now(JST).strftime("%Y-%m-%d"),
+            "title": clean_text(title) or "自分で作った料理",
+            "details": details,
+            "created_at": now_text(),
+        }
+    )
+    save_state(state)
+
+
 def merge_quantity(current: str, incoming: str) -> str:
     current = clean_text(current)
     incoming = clean_text(incoming)
@@ -856,19 +876,11 @@ def mark_selected_meal_cooked(conversation_id: str) -> str:
         return "作った献立がまだ選ばれていません。先に A / B / C で選んでください。"
 
     option = pending["payload"]
-    state = load_state()
-    state["counters"]["meal_history"] += 1
-    state["meal_history"].append(
-        {
-            "id": state["counters"]["meal_history"],
-            "conversation_id": conversation_id,
-            "meal_date": datetime.now(JST).strftime("%Y-%m-%d"),
-            "title": clean_text(option.get("title")),
-            "details": option,
-            "created_at": now_text(),
-        }
+    add_meal_history_entry(
+        conversation_id,
+        clean_text(option.get("title")),
+        {"source": "selected_meal", "option": option},
     )
-    save_state(state)
 
     updated_inventory, note = reconcile_inventory_after_cooking(
         get_inventory(),
@@ -932,6 +944,128 @@ def should_treat_as_inventory(text: str) -> bool:
     return has_keyword or (has_quantity and has_separator)
 
 
+def should_adjust_inventory(text: str) -> bool:
+    normalized = clean_text(text)
+    if any(word in normalized for word in ["買った", "購入", "追加", "在庫追加", "レシート"]):
+        return False
+
+    keywords = [
+        "使った",
+        "使いました",
+        "消費",
+        "減らして",
+        "減らす",
+        "減った",
+        "捨てた",
+        "廃棄",
+        "なくなった",
+        "残り",
+        "在庫修正",
+        "在庫を修正",
+        "上書き",
+        "残量",
+        "自分で",
+        "別料理",
+    ]
+    has_keyword = any(keyword in normalized for keyword in keywords)
+    has_quantity = any(char.isdigit() for char in normalized) or any(
+        unit in normalized for unit in ["個", "本", "枚", "g", "kg", "ml", "パック", "袋", "玉", "半分"]
+    )
+    cooked_with_items = ("作った" in normalized or "つくった" in normalized) and has_quantity
+    return (has_keyword and has_quantity) or cooked_with_items
+
+
+def apply_manual_inventory_update(conversation_id: str, text: str) -> str:
+    current_inventory = get_inventory()
+    system = """
+あなたは家庭の食材在庫を更新するアシスタントです。
+ユーザーの自然文から、在庫を増やす・減らす・残量を上書きする操作を判断します。
+
+ルール:
+- 「買った」「購入」「追加」は add。
+- 「使った」「消費」「食べた」「捨てた」「廃棄」「自分で料理した」は consume。
+- 「残り」「在庫修正」「上書き」「残量」は set。
+- current_inventory にない食材を consume しようとしている場合は、勝手に追加しない。
+- 数量計算が曖昧なときは、無理に正確計算せず quantity に「残り目安: ...」のように書く。
+- 同じ食材名はできるだけ統一する。例: 鶏もも、鶏もも肉。
+- 自分で料理した内容が分かる場合は meal_title に料理名を書く。
+- 在庫更新後の全在庫を inventory_after に入れる。
+
+必ずJSONだけで返してください。
+形式:
+{
+  "action": "add | consume | set | noop",
+  "inventory_after": [{"name":"卵","quantity":"残り4個","note":""}],
+  "changed_items": [{"name":"卵","quantity":"2個","change":"consume"}],
+  "meal_title": "カレー",
+  "note": "補足",
+  "preference_notes": ["今後覚えるべき好みや事情"]
+}
+"""
+    user = json.dumps(
+        {
+            "user_message": text,
+            "current_inventory": current_inventory,
+        },
+        ensure_ascii=False,
+    )
+    data = openai_json(
+        [
+            {"role": "system", "content": textwrap.dedent(system).strip()},
+            {"role": "user", "content": user},
+        ]
+    )
+
+    action = clean_text(data.get("action")).lower()
+    if action not in {"add", "consume", "set", "noop"}:
+        action = "noop"
+
+    if action == "noop":
+        return (
+            "在庫更新の内容をうまく読み取れませんでした。\n"
+            "例: 「使った: 卵2個、豚こま200g」または「在庫修正: 卵 残り4個」"
+        )
+
+    inventory_after = normalize_items(data.get("inventory_after", []))
+    if not inventory_after and current_inventory:
+        return "在庫更新後の内容を確認できなかったため、変更しませんでした。もう少し具体的に送ってください。"
+
+    set_inventory(inventory_after)
+
+    changed_items = normalize_items(data.get("changed_items", []))
+    meal_title = clean_text(data.get("meal_title"))
+    if meal_title and action == "consume":
+        add_meal_history_entry(
+            conversation_id,
+            meal_title,
+            {
+                "source": "manual_inventory_update",
+                "user_message": text,
+                "changed_items": changed_items,
+            },
+        )
+
+    preference_notes = data.get("preference_notes", [])
+    if isinstance(preference_notes, list):
+        for note in preference_notes:
+            add_preference("note", clean_text(note), "manual_inventory_update")
+
+    action_label = {
+        "add": "追加",
+        "consume": "消費",
+        "set": "修正",
+    }.get(action, "更新")
+    changed_text = format_inventory(changed_items)
+    note_text = clean_text(data.get("note"))
+    note_block = f"\n\nメモ: {note_text}" if note_text else ""
+    return (
+        f"在庫を{action_label}しました。\n\n"
+        f"変更内容:\n{changed_text}\n\n"
+        f"現在の在庫:\n{format_inventory(get_inventory())}"
+        f"{note_block}"
+    )
+
+
 def learn_from_text(text: str) -> None:
     normalized = clean_text(text)
     dislike_words = ["苦手", "嫌い", "いや", "嫌", "無理", "避けたい"]
@@ -987,6 +1121,8 @@ def handle_text_message(event: dict[str, Any], conversation_id: str) -> str:
         reply = "現在の在庫:\n" + format_inventory(get_inventory())
     elif text in {"ヘルプ", "help", "使い方"}:
         reply = help_text()
+    elif should_adjust_inventory(text):
+        reply = apply_manual_inventory_update(conversation_id, text)
     elif "作った" in text or "つくった" in text:
         reply = mark_selected_meal_cooked(conversation_id)
     elif any(word in text for word in ["微妙", "別案", "他の案", "ほかの案", "違う"]):
@@ -1060,6 +1196,10 @@ def help_text() -> str:
 - 「作った」: 作った記録をつけ、在庫を更新します
 - 「在庫」: 今ある材料を確認します
 - 「鶏もも 300g、玉ねぎ 2個」: 食材を追加します
+- 「使った: 卵2個、豚こま200g」: 在庫を減らします
+- 「捨てた: キャベツ半玉」: 在庫を減らします
+- 「在庫修正: 卵 残り4個」: 残量を上書きします
+- 「今日は自分でカレー作った。鶏もも300g、玉ねぎ2個使った」: 在庫を減らし、料理履歴にも残します
 - レシート写真: 食材を読み取って、確認後に在庫追加します"""
 
 
