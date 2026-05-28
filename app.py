@@ -73,6 +73,14 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 state_lock = threading.RLock()
 storage_init_error = ""
 
+BOT_NAME = "ミュウ"
+BOT_PERSONA = (
+    "あなたはメス猫の献立AI「ミュウ」です。"
+    "一人称は「ミュウ」。親しみやすく、語尾に自然な頻度で「にゃ」「だにゃ」「ですにゃ」を混ぜます。"
+    "ただし材料名、分量、火加減、加熱時間、在庫数、金額は正確さを最優先し、猫語で曖昧にしないでください。"
+    "かわいくても実用性を優先し、「にゃ」を連発しすぎないでください。"
+)
+
 DEFAULT_AVOID = [
     "固形のチーズ",
     "辛い食べ物",
@@ -708,6 +716,7 @@ def generate_meal_options(
 ) -> dict[str, Any]:
     intent = "別案を3つ提案してください。" if alternatives else "夕食案を3つ提案してください。"
     system = f"""
+{BOT_PERSONA}
 あなたは、プロの栄養士であり、日本トップクラスの料理人として家庭の夕食を提案する献立AIです。
 2人分の夕食を、健康寄りだがおいしく満足感がある内容で提案します。
 太りにくさ・お腹が出にくい食事を意識し、極端なダイエット食にはしません。
@@ -722,6 +731,21 @@ def generate_meal_options(
 - 似た主菜や同じ味付けは14日以内に避ける。
 - 同じ主たんぱく質を2日連続にしない。
 
+作り方の具体性:
+- used_ingredients には、在庫・買い足し・常備調味料を含め、実際に使う全材料を2人分の分量つきで入れる。
+- 調味料は「醤油 大さじ1」「味噌 大さじ1.5」「水 400ml」のように具体量を書く。
+- 「適量」は原則使わない。塩こしょうなど最終調整が必要なものも、目安量を先に書く。
+- recipe_steps は5から8手順にし、切り方、加える順番、火加減、加熱時間、完成の目安を入れる。
+- 調味料を入れる手順では、入れる調味料名と分量をその手順内にも書く。
+
+候補比較のしやすさ:
+- summary は、味・手軽さ・満足感がわかる1文にする。
+- summary、why、belly_friendly_point は、ミュウらしく自然に猫口調にしてよい。
+- estimated_time_minutes は、準備から完成までの目安分数を整数で入れる。
+- cleanup_level は「少なめ」「普通」「多め」のいずれかにし、洗い物量の目安にする。
+- make_ahead は「可」「一部可」「不可」のいずれかと短い理由を書く。
+- recipe_steps は安全性とわかりやすさを優先し、分量・火加減・時間を崩さず、猫口調を入れすぎない。
+
 必ず JSON だけで返してください。
 形式:
 {{
@@ -730,13 +754,17 @@ def generate_meal_options(
       "label": "A",
       "title": "献立名",
       "menu": ["主菜", "副菜", "汁物など"],
+      "summary": "候補一覧で比較しやすい短い説明",
       "why": "おすすめ理由",
       "belly_friendly_point": "お腹が出にくい工夫",
+      "estimated_time_minutes": 25,
+      "cleanup_level": "少なめ",
+      "make_ahead": "一部可。副菜は先に作れる",
       "estimated_cost_yen": 1000,
       "uses_inventory": ["使う在庫"],
       "ingredients_to_buy": ["買い足す材料と分量"],
-      "used_ingredients": [{{"name":"食材名","quantity":"使う量"}}],
-      "recipe_steps": ["作り方1", "作り方2", "作り方3"]
+      "used_ingredients": [{{"name":"食材名または調味料名","quantity":"2人分で使う量"}}],
+      "recipe_steps": ["具体的な作り方1", "具体的な作り方2", "具体的な作り方3", "具体的な作り方4", "具体的な作り方5"]
     }}
   ]
 }}
@@ -772,34 +800,26 @@ def generate_meal_options(
 
 
 def format_meal_options(payload: dict[str, Any]) -> str:
-    lines = ["今日の夕食案を3つ出します。微妙なら「微妙」と送ってください。", ""]
+    lines = [f"{BOT_NAME}が今日の夕食案を3つ選んだにゃ。比較しやすいよう短めにまとめるにゃ。", ""]
     for option in payload.get("options", []):
         label = clean_text(option.get("label"))
         title = clean_text(option.get("title"))
         menu = as_list_text(option.get("menu"))
         buy = as_list_text(option.get("ingredients_to_buy")) or "買い足しなし"
-        steps = option.get("recipe_steps") or []
-        if not isinstance(steps, list):
-            steps = [clean_text(steps)]
+        summary = clean_text(option.get("summary")) or clean_text(option.get("why"))
 
         lines.extend(
             [
                 f"{label}. {title}",
                 f"献立: {menu}",
-                f"理由: {clean_text(option.get('why'))}",
-                f"お腹対策: {clean_text(option.get('belly_friendly_point'))}",
+                f"特徴: {summary}",
+                f"目安: {format_option_meta(option)}",
                 f"目安費用: {clean_text(option.get('estimated_cost_yen'))}円",
                 f"買い足し: {buy}",
-                "作り方:",
             ]
         )
-        lines.extend(
-            f"{idx}. {clean_text(step)}"
-            for idx, step in enumerate(steps, 1)
-            if clean_text(step)
-        )
         lines.append("")
-    lines.append("作るものが決まったら A / B / C で返してください。")
+    lines.append("作るものが決まったら A / B / C、先に詳細を見るなら「詳しくA」、微妙なら「微妙」と送ってにゃ。")
     return "\n".join(lines).strip()
 
 
@@ -809,6 +829,94 @@ def as_list_text(value: Any) -> str:
     return clean_text(value)
 
 
+def format_item_list(value: Any) -> str:
+    items = normalize_items(value)
+    if items:
+        formatted = []
+        for item in items:
+            name = clean_text(item.get("name"))
+            quantity = clean_text(item.get("quantity"))
+            note = clean_text(item.get("note"))
+            if not name:
+                continue
+            text = f"{name} {quantity}".strip()
+            if note:
+                text = f"{text}（{note}）"
+            formatted.append(text)
+        return "、".join(formatted)
+    return as_list_text(value)
+
+
+def format_option_meta(option: dict[str, Any]) -> str:
+    time_text = clean_text(
+        option.get("estimated_time_minutes")
+        or option.get("time_minutes")
+        or option.get("estimated_time")
+    )
+    if time_text and time_text.isdigit():
+        time_text = f"{time_text}分"
+
+    cleanup = clean_text(
+        option.get("cleanup_level")
+        or option.get("cleanup")
+        or option.get("washing_up")
+    )
+    make_ahead = clean_text(
+        option.get("make_ahead")
+        or option.get("make_ahead_note")
+        or option.get("prep_ahead")
+    )
+
+    parts = []
+    if time_text:
+        parts.append(f"所要{time_text}")
+    if cleanup:
+        parts.append(f"洗い物{cleanup}")
+    if make_ahead:
+        parts.append(f"作り置き{make_ahead}")
+    return " / ".join(parts) or "目安未取得"
+
+
+def preview_meal_option_detail(conversation_id: str, text: str) -> str | None:
+    selected = normalize_detail_selection(text)
+    if selected is None:
+        return None
+
+    pending = get_pending_action(conversation_id, "meal_options")
+    if not pending:
+        return "いま詳しく見られる献立案がないにゃ。「献立」または「別案」と送ってにゃ。"
+
+    options = pending["payload"].get("options", [])
+    if selected >= len(options):
+        return "A / B / C のどれを詳しく見るか送ってにゃ。例: 詳しくA"
+
+    option = options[selected]
+    label = clean_text(option.get("label")) or "A"
+    title = clean_text(option.get("title"))
+    return (
+        f"{label}. {title} の詳細だにゃ。まだ選択はしていないにゃ。\n\n"
+        f"{format_single_recipe(option)}\n\n"
+        f"これで作るなら「{label}」と送ってにゃ。"
+    )
+
+
+def repeat_selected_meal_detail(conversation_id: str, text: str) -> str | None:
+    normalized = clean_text(text)
+    if not any(word in normalized for word in ["作り方", "レシピ", "詳細"]):
+        return None
+
+    pending = get_pending_action(conversation_id, "selected_meal")
+    if not pending:
+        return None
+
+    option = pending["payload"]
+    return (
+        "選んだ献立の詳細をもう一度出すにゃ。\n\n"
+        f"{format_single_recipe(option)}\n\n"
+        "実際に作ったら「作った」と送ってにゃ。在庫はその時点でミュウが更新するにゃ。"
+    )
+
+
 def select_meal_option(conversation_id: str, text: str) -> str | None:
     selected = normalize_selection(text)
     if selected is None:
@@ -816,11 +924,11 @@ def select_meal_option(conversation_id: str, text: str) -> str | None:
 
     pending = get_pending_action(conversation_id, "meal_options")
     if not pending:
-        return "いま選べる献立案がありません。「献立」または「別案」と送ってください。"
+        return "いま選べる献立案がないにゃ。「献立」または「別案」と送ってにゃ。"
 
     options = pending["payload"].get("options", [])
     if selected >= len(options):
-        return "A / B / C のどれかで選んでください。"
+        return "A / B / C のどれかで選んでにゃ。"
 
     option = options[selected]
     finish_pending_action(pending["id"], "selected")
@@ -828,9 +936,9 @@ def select_meal_option(conversation_id: str, text: str) -> str | None:
     add_preference("like", clean_text(option.get("title")), "selected")
 
     return (
-        f"{option.get('label')}. {option.get('title')} でいきましょう。\n\n"
+        f"{option.get('label')}. {option.get('title')} でいくにゃ。\n\n"
         f"{format_single_recipe(option)}\n\n"
-        "実際に作ったら「作った」と送ってください。在庫をその時点で更新します。"
+        "実際に作ったら「作った」と送ってにゃ。在庫はその時点でミュウが更新するにゃ。"
     )
 
 
@@ -853,13 +961,41 @@ def normalize_selection(text: str) -> int | None:
     return mapping.get(normalized)
 
 
+def normalize_detail_selection(text: str) -> int | None:
+    normalized = clean_text(text).upper().replace(" ", "").replace("　", "")
+    detail_keywords = ["詳しく", "詳細", "作り方", "レシピ", "材料"]
+    if not any(keyword in normalized for keyword in detail_keywords):
+        return None
+
+    for label, index in [
+        ("A", 0),
+        ("Ａ", 0),
+        ("1", 0),
+        ("１", 0),
+        ("B", 1),
+        ("Ｂ", 1),
+        ("2", 1),
+        ("２", 1),
+        ("C", 2),
+        ("Ｃ", 2),
+        ("3", 2),
+        ("３", 2),
+    ]:
+        if label in normalized:
+            return index
+    return None
+
+
 def format_single_recipe(option: dict[str, Any]) -> str:
     steps = option.get("recipe_steps") or []
     if not isinstance(steps, list):
         steps = [clean_text(steps)]
     lines = [
         f"献立: {as_list_text(option.get('menu'))}",
+        f"目安: {format_option_meta(option)}",
+        f"お腹対策: {clean_text(option.get('belly_friendly_point'))}",
         f"買い足し: {as_list_text(option.get('ingredients_to_buy')) or '買い足しなし'}",
+        f"使う材料: {format_item_list(option.get('used_ingredients')) or '分量未取得'}",
         "作り方:",
     ]
     lines.extend(
@@ -873,7 +1009,7 @@ def format_single_recipe(option: dict[str, Any]) -> str:
 def mark_selected_meal_cooked(conversation_id: str) -> str:
     pending = get_pending_action(conversation_id, "selected_meal")
     if not pending:
-        return "作った献立がまだ選ばれていません。先に A / B / C で選んでください。"
+        return "作った献立がまだ選ばれていないにゃ。先に A / B / C で選んでにゃ。"
 
     option = pending["payload"]
     add_meal_history_entry(
@@ -892,7 +1028,7 @@ def mark_selected_meal_cooked(conversation_id: str) -> str:
     finish_pending_action(pending["id"], "done")
     inventory_text = format_inventory(get_inventory())
     note_text = f"\n\n在庫メモ: {note}" if note else ""
-    return f"作った記録をつけました。おつかれさまです。\n\n現在の在庫:\n{inventory_text}{note_text}"
+    return f"作った記録をつけたにゃ。おつかれさまですにゃ。\n\n現在の在庫:\n{inventory_text}{note_text}"
 
 
 def reconcile_inventory_after_cooking(
@@ -1022,13 +1158,13 @@ def apply_manual_inventory_update(conversation_id: str, text: str) -> str:
 
     if action == "noop":
         return (
-            "在庫更新の内容をうまく読み取れませんでした。\n"
+            "在庫更新の内容をうまく読み取れなかったにゃ。\n"
             "例: 「使った: 卵2個、豚こま200g」または「在庫修正: 卵 残り4個」"
         )
 
     inventory_after = normalize_items(data.get("inventory_after", []))
     if not inventory_after and current_inventory:
-        return "在庫更新後の内容を確認できなかったため、変更しませんでした。もう少し具体的に送ってください。"
+        return "在庫更新後の内容を確認できなかったから、変更しなかったにゃ。もう少し具体的に送ってにゃ。"
 
     set_inventory(inventory_after)
 
@@ -1059,7 +1195,7 @@ def apply_manual_inventory_update(conversation_id: str, text: str) -> str:
     note_text = clean_text(data.get("note"))
     note_block = f"\n\nメモ: {note_text}" if note_text else ""
     return (
-        f"在庫を{action_label}しました。\n\n"
+        f"在庫を{action_label}したにゃ。\n\n"
         f"変更内容:\n{changed_text}\n\n"
         f"現在の在庫:\n{format_inventory(get_inventory())}"
         f"{note_block}"
@@ -1083,9 +1219,10 @@ def chat_reply(conversation_id: str, user_text: str) -> str:
         {
             "role": "system",
             "content": (
+                f"{BOT_PERSONA}"
                 "あなたはLINEで会話する献立AIです。"
                 "ユーザーの好みを尊重し、断られたら理由を学習し、次の提案に反映します。"
-                "返答は親しみやすく簡潔に。必要なら献立・在庫・別案の操作を案内します。\n\n"
+                "返答はミュウらしく親しみやすく簡潔に。必要なら献立・在庫・別案の操作を案内します。\n\n"
                 + context_summary(conversation_id)
             ),
         },
@@ -1103,14 +1240,24 @@ def handle_text_message(event: dict[str, Any], conversation_id: str) -> str:
     if receipt_pending and is_yes(text):
         added = add_inventory_items(receipt_pending["payload"].get("items", []))
         finish_pending_action(receipt_pending["id"])
-        reply = "レシートの食材を在庫に追加しました。\n\n" + format_added_items(added)
+        reply = "レシートの食材を在庫に追加したにゃ。\n\n" + format_added_items(added)
         save_message(conversation_id, "assistant", reply)
         return reply
     if receipt_pending and is_no(text):
         finish_pending_action(receipt_pending["id"], "cancelled")
-        reply = "レシートの登録をキャンセルしました。"
+        reply = "レシートの登録をキャンセルしたにゃ。"
         save_message(conversation_id, "assistant", reply)
         return reply
+
+    detail_reply = preview_meal_option_detail(conversation_id, text)
+    if detail_reply:
+        save_message(conversation_id, "assistant", detail_reply)
+        return detail_reply
+
+    repeat_detail_reply = repeat_selected_meal_detail(conversation_id, text)
+    if repeat_detail_reply:
+        save_message(conversation_id, "assistant", repeat_detail_reply)
+        return repeat_detail_reply
 
     selected_reply = select_meal_option(conversation_id, text)
     if selected_reply:
@@ -1118,7 +1265,7 @@ def handle_text_message(event: dict[str, Any], conversation_id: str) -> str:
         return selected_reply
 
     if text in {"在庫", "ざいこ", "材料", "食材"}:
-        reply = "現在の在庫:\n" + format_inventory(get_inventory())
+        reply = "いまの在庫だにゃ:\n" + format_inventory(get_inventory())
     elif text in {"ヘルプ", "help", "使い方"}:
         reply = help_text()
     elif should_adjust_inventory(text):
@@ -1135,9 +1282,9 @@ def handle_text_message(event: dict[str, Any], conversation_id: str) -> str:
         items = extract_inventory_from_text(text)
         if items:
             added = add_inventory_items(items)
-            reply = "在庫に追加しました。\n\n" + format_added_items(added)
+            reply = "在庫に追加したにゃ。\n\n" + format_added_items(added)
         else:
-            reply = "食材をうまく読み取れませんでした。例: 鶏もも肉 300g、玉ねぎ 2個"
+            reply = "食材をうまく読み取れなかったにゃ。例: 鶏もも肉 300g、玉ねぎ 2個"
     else:
         reply = chat_reply(conversation_id, text)
 
@@ -1148,16 +1295,16 @@ def handle_text_message(event: dict[str, Any], conversation_id: str) -> str:
 def handle_image_message(event: dict[str, Any], conversation_id: str) -> str:
     message_id = event.get("message", {}).get("id")
     if not message_id:
-        return "画像IDを取得できませんでした。もう一度送ってください。"
+        return "画像IDを取得できなかったにゃ。もう一度送ってにゃ。"
 
     image_bytes = fetch_line_message_content(message_id)
     items = extract_receipt_items(image_bytes)
     if not items:
-        return "レシートから食材を読み取れませんでした。もう少し明るい写真で再送してください。"
+        return "レシートから食材を読み取れなかったにゃ。もう少し明るい写真で再送してにゃ。"
 
     create_pending_action(conversation_id, "receipt_items", {"items": items})
     return (
-        "レシートから次の食材を読み取りました。在庫に追加してよければ「はい」と送ってください。\n\n"
+        "レシートから次の食材を読み取ったにゃ。在庫に追加してよければ「はい」と送ってにゃ。\n\n"
         + format_added_items(items)
     )
 
@@ -1189,18 +1336,20 @@ def format_added_items(items: list[dict[str, str]]) -> str:
 
 
 def help_text() -> str:
-    return """使えるメッセージ:
-- 「献立」: 今日の夕食を3案出します
-- 「微妙」: 別案を3つ出します
-- 「A」「B」「C」: 作る案を選びます
-- 「作った」: 作った記録をつけ、在庫を更新します
-- 「在庫」: 今ある材料を確認します
-- 「鶏もも 300g、玉ねぎ 2個」: 食材を追加します
-- 「使った: 卵2個、豚こま200g」: 在庫を減らします
-- 「捨てた: キャベツ半玉」: 在庫を減らします
-- 「在庫修正: 卵 残り4個」: 残量を上書きします
-- 「今日は自分でカレー作った。鶏もも300g、玉ねぎ2個使った」: 在庫を減らし、料理履歴にも残します
-- レシート写真: 食材を読み取って、確認後に在庫追加します"""
+    return f"""{BOT_NAME}ができることだにゃ:
+- 「献立」: 今日の夕食を3案出すにゃ
+- 「微妙」: 別案を3つ出すにゃ
+- 「詳しくA」: A案の材料・分量・作り方を選択前に確認するにゃ
+- 「A」「B」「C」: 作る案を選び、詳細レシピを表示するにゃ
+- 「作り方」: 選んだ献立のレシピをもう一度表示するにゃ
+- 「作った」: 作った記録をつけ、在庫を更新するにゃ
+- 「在庫」: 今ある材料を確認するにゃ
+- 「鶏もも 300g、玉ねぎ 2個」: 食材を追加するにゃ
+- 「使った: 卵2個、豚こま200g」: 在庫を減らすにゃ
+- 「捨てた: キャベツ半玉」: 在庫を減らすにゃ
+- 「在庫修正: 卵 残り4個」: 残量を上書きするにゃ
+- 「今日は自分でカレー作った。鶏もも300g、玉ねぎ2個使った」: 在庫を減らし、料理履歴にも残すにゃ
+- レシート写真: 食材を読み取って、確認後に在庫追加するにゃ"""
 
 
 def verify_line_signature(body: bytes, signature: str) -> bool:
@@ -1296,8 +1445,8 @@ def handle_line_event(event: dict[str, Any]) -> None:
 
     if event_type in {"follow", "join"}:
         reply = (
-            "献立AIを登録しました。\n"
-            "朝8時に夕食案を3つ送ります。\n\n"
+            f"献立AIの{BOT_NAME}だにゃ。登録できたにゃ。\n"
+            "朝8時に夕食案を3つ送るにゃ。\n\n"
             + help_text()
         )
         if reply_token:
@@ -1314,10 +1463,10 @@ def handle_line_event(event: dict[str, Any]) -> None:
         elif message_type == "image":
             reply = handle_image_message(event, conversation_id)
         else:
-            reply = "テキストかレシート画像で送ってください。"
+            reply = "テキストかレシート画像で送ってにゃ。"
     except Exception as exc:
         logger.exception("Failed to handle LINE event: %s", exc)
-        reply = "すみません、処理中にエラーが出ました。少し時間を置いてもう一度送ってください。"
+        reply = "ごめんにゃ、処理中にエラーが出たにゃ。少し時間を置いてもう一度送ってにゃ。"
 
     if reply_token:
         reply_text(reply_token, reply)
@@ -1334,7 +1483,7 @@ def send_daily_suggestions() -> dict[str, Any]:
     for target_id in targets:
         try:
             payload = generate_meal_options(target_id)
-            push_text(target_id, "おはようございます。今日の夕食案です。\n\n" + format_meal_options(payload))
+            push_text(target_id, f"おはようにゃ。{BOT_NAME}から今日の夕食案だにゃ。\n\n" + format_meal_options(payload))
             sent += 1
         except Exception as exc:
             logger.exception("Failed to send daily suggestion to %s: %s", target_id, exc)
