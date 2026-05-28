@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -11,8 +12,8 @@ import threading
 import time
 import textwrap
 import urllib.error
+import urllib.parse
 import urllib.request
-from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -62,8 +63,15 @@ SCHEDULE_MINUTE = int(os.getenv("SCHEDULE_MINUTE", "0"))
 ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "true").lower() == "true"
 TASK_SECRET = os.getenv("TASK_SECRET", "")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_STATE_KEY = os.getenv("SUPABASE_STATE_KEY", "global")
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+STORAGE_BACKEND = "supabase" if USE_SUPABASE else "sqlite"
 
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+state_lock = threading.RLock()
+storage_init_error = ""
 
 DEFAULT_AVOID = [
     "固形のチーズ",
@@ -84,168 +92,253 @@ DEFAULT_NOTES = [
     "常備調味料は醤油、味噌、酒、酢、ウスターソース、みりん、砂糖、はちみつ、オイスターソース、ナツメグ、塩こしょう、マヨネーズ、コンソメ、ほんだし、米。",
     "朝8時に夕食案を3つ出す。微妙と言われたら別案を3つ出す。",
     "採用した料理は、作ったと返信された後に在庫を減らす。",
+    "同じ料理名は30日以内に出さず、似た主菜は14日以内に避ける。",
+    "同じ主たんぱく質を2日連続にしない。調理法も焼く、煮る、蒸す、炒めるで偏らせない。",
 ]
 
 
-@contextmanager
-def db() -> Any:
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+def now_text() -> str:
+    return datetime.now(JST).isoformat(timespec="seconds")
+
+
+def clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def default_state() -> dict[str, Any]:
+    return {
+        "inventory": [],
+        "preferences": [],
+        "conversations": [],
+        "messages": [],
+        "pending_actions": [],
+        "meal_history": [],
+        "counters": {
+            "message": 0,
+            "pending_action": 0,
+            "meal_history": 0,
+        },
+    }
+
+
+def ensure_state_shape(state: dict[str, Any]) -> dict[str, Any]:
+    baseline = default_state()
+    for key, value in baseline.items():
+        state.setdefault(key, copy.deepcopy(value))
+    for key, value in baseline["counters"].items():
+        state["counters"].setdefault(key, value)
+
+    changed = False
+    for item in DEFAULT_AVOID:
+        changed = add_preference_to_state(state, "avoid", item, "initial") or changed
+    for note in DEFAULT_NOTES:
+        changed = add_preference_to_state(state, "note", note, "initial") or changed
+    if changed:
+        state["_changed_by_defaults"] = True
+    return state
+
+
+def add_preference_to_state(
+    state: dict[str, Any],
+    kind: str,
+    content: str,
+    source: str,
+) -> bool:
+    content = clean_text(content)
+    if not content:
+        return False
+    for pref in state["preferences"]:
+        if pref.get("kind") == kind and pref.get("content") == content:
+            return False
+    state["preferences"].append(
+        {
+            "kind": kind,
+            "content": content,
+            "source": source,
+            "created_at": now_text(),
+        }
+    )
+    return True
+
+
+def supabase_request(
+    method: str,
+    path: str,
+    payload: Any | None = None,
+    prefer: str | None = None,
+) -> Any:
+    url = f"{SUPABASE_URL}/rest/v1/{path.lstrip('/')}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Accept": "application/json",
+    }
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if prefer:
+        headers["Prefer"] = prefer
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+        with urllib.request.urlopen(req, timeout=30) as response:
+            body = response.read().decode("utf-8")
+            if not body:
+                return None
+            return json.loads(body)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Supabase API error {exc.code}: {detail}") from exc
 
 
-def init_db() -> None:
-    with db() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS inventory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                quantity TEXT NOT NULL DEFAULT '',
-                note TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS preferences (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL,
-                content TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT 'user',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(kind, content)
-            );
-
-            CREATE TABLE IF NOT EXISTS conversations (
-                conversation_id TEXT PRIMARY KEY,
-                source_type TEXT NOT NULL,
-                user_id TEXT,
-                target_id TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS pending_actions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT NOT NULL,
-                action_type TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS meal_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT NOT NULL,
-                meal_date TEXT NOT NULL,
-                title TEXT NOT NULL,
-                details TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            """
-        )
-
-    seed_defaults()
-
-
-def seed_defaults() -> None:
-    with db() as conn:
-        for item in DEFAULT_AVOID:
-            conn.execute(
-                "INSERT OR IGNORE INTO preferences (kind, content, source) VALUES (?, ?, ?)",
-                ("avoid", item, "initial"),
+def load_state() -> dict[str, Any]:
+    with state_lock:
+        if USE_SUPABASE:
+            key = urllib.parse.quote(SUPABASE_STATE_KEY, safe="")
+            rows = supabase_request(
+                "GET",
+                f"bot_state?key=eq.{key}&select=value",
             )
-        for note in DEFAULT_NOTES:
+            if rows:
+                state = rows[0].get("value") or default_state()
+            else:
+                state = default_state()
+            ensure_state_shape(state)
+            if state.pop("_changed_by_defaults", False) or not rows:
+                save_state(state)
+            return state
+
+        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+        with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
-                "INSERT OR IGNORE INTO preferences (kind, content, source) VALUES (?, ?, ?)",
-                ("note", note, "initial"),
+                """
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+            row = conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?",
+                (SUPABASE_STATE_KEY,),
+            ).fetchone()
+            state = json.loads(row[0]) if row else default_state()
+            ensure_state_shape(state)
+            if state.pop("_changed_by_defaults", False) or not row:
+                save_state(state)
+            return state
+
+
+def save_state(state: dict[str, Any]) -> None:
+    with state_lock:
+        if USE_SUPABASE:
+            payload = [{"key": SUPABASE_STATE_KEY, "value": state}]
+            supabase_request(
+                "POST",
+                "bot_state?on_conflict=key",
+                payload,
+                prefer="resolution=merge-duplicates,return=minimal",
+            )
+            return
+
+        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO bot_state (key, value, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = datetime('now')
+                """,
+                (SUPABASE_STATE_KEY, json.dumps(state, ensure_ascii=False)),
             )
 
 
-def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
-    return [dict(row) for row in rows]
+def init_storage() -> None:
+    global storage_init_error
+    try:
+        state = load_state()
+        save_state(state)
+        storage_init_error = ""
+        logger.info("Storage initialized using %s", STORAGE_BACKEND)
+    except Exception as exc:
+        storage_init_error = str(exc)
+        logger.exception("Storage initialization failed: %s", exc)
 
 
 def get_inventory() -> list[dict[str, str]]:
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT name, quantity, note FROM inventory ORDER BY name"
-        ).fetchall()
-    return rows_to_dicts(rows)
+    state = load_state()
+    return sorted(
+        [
+            {
+                "name": clean_text(item.get("name")),
+                "quantity": clean_text(item.get("quantity")),
+                "note": clean_text(item.get("note")),
+            }
+            for item in state["inventory"]
+            if clean_text(item.get("name"))
+        ],
+        key=lambda item: item["name"],
+    )
 
 
 def set_inventory(items: list[dict[str, str]]) -> None:
-    with db() as conn:
-        conn.execute("DELETE FROM inventory")
-        for item in items:
-            name = clean_text(item.get("name", ""))
-            if not name:
-                continue
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO inventory (name, quantity, note, updated_at)
-                VALUES (?, ?, ?, datetime('now'))
-                """,
-                (
-                    name,
-                    clean_text(item.get("quantity", "")),
-                    clean_text(item.get("note", "")),
-                ),
-            )
+    state = load_state()
+    normalized = []
+    seen = set()
+    for item in items:
+        name = clean_text(item.get("name"))
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        normalized.append(
+            {
+                "name": name,
+                "quantity": clean_text(item.get("quantity")),
+                "note": clean_text(item.get("note")),
+            }
+        )
+    state["inventory"] = normalized
+    save_state(state)
 
 
 def add_inventory_items(items: list[dict[str, str]]) -> list[dict[str, str]]:
+    state = load_state()
     added: list[dict[str, str]] = []
-    with db() as conn:
-        for item in items:
-            name = clean_text(item.get("name", ""))
-            quantity = clean_text(item.get("quantity", ""))
-            note = clean_text(item.get("note", ""))
-            if not name:
-                continue
+    by_name = {
+        clean_text(item.get("name")): item
+        for item in state["inventory"]
+        if clean_text(item.get("name"))
+    }
 
-            existing = conn.execute(
-                "SELECT quantity, note FROM inventory WHERE name = ?",
-                (name,),
-            ).fetchone()
-            if existing:
-                merged_quantity = merge_quantity(existing["quantity"], quantity)
-                merged_note = merge_note(existing["note"], note)
-                conn.execute(
-                    """
-                    UPDATE inventory
-                    SET quantity = ?, note = ?, updated_at = datetime('now')
-                    WHERE name = ?
-                    """,
-                    (merged_quantity, merged_note, name),
-                )
-            else:
-                conn.execute(
-                    """
-                    INSERT INTO inventory (name, quantity, note)
-                    VALUES (?, ?, ?)
-                    """,
-                    (name, quantity, note),
-                )
-            added.append({"name": name, "quantity": quantity, "note": note})
+    for item in items:
+        name = clean_text(item.get("name"))
+        quantity = clean_text(item.get("quantity"))
+        note = clean_text(item.get("note"))
+        if not name:
+            continue
+        if name in by_name:
+            existing = by_name[name]
+            existing["quantity"] = merge_quantity(clean_text(existing.get("quantity")), quantity)
+            existing["note"] = merge_note(clean_text(existing.get("note")), note)
+        else:
+            by_name[name] = {"name": name, "quantity": quantity, "note": note}
+            state["inventory"].append(by_name[name])
+        added.append({"name": name, "quantity": quantity, "note": note})
+
+    save_state(state)
     return added
 
 
@@ -266,25 +359,20 @@ def merge_note(current: str, incoming: str) -> str:
 
 
 def get_preferences() -> dict[str, list[str]]:
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT kind, content FROM preferences ORDER BY id"
-        ).fetchall()
+    state = load_state()
     prefs: dict[str, list[str]] = {"avoid": [], "like": [], "dislike": [], "note": []}
-    for row in rows:
-        prefs.setdefault(row["kind"], []).append(row["content"])
+    for pref in state["preferences"]:
+        kind = clean_text(pref.get("kind"))
+        content = clean_text(pref.get("content"))
+        if kind and content:
+            prefs.setdefault(kind, []).append(content)
     return prefs
 
 
 def add_preference(kind: str, content: str, source: str = "user") -> None:
-    content = clean_text(content)
-    if not content:
-        return
-    with db() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO preferences (kind, content, source) VALUES (?, ?, ?)",
-            (kind, content, source),
-        )
+    state = load_state()
+    if add_preference_to_state(state, kind, content, source):
+        save_state(state)
 
 
 def register_conversation(source: dict[str, Any]) -> str:
@@ -300,70 +388,99 @@ def register_conversation(source: dict[str, Any]) -> str:
     if not target_id:
         raise ValueError("LINE source has no target id")
 
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO conversations (conversation_id, source_type, user_id, target_id)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(conversation_id) DO UPDATE SET
-                source_type = excluded.source_type,
-                user_id = COALESCE(excluded.user_id, conversations.user_id),
-                target_id = excluded.target_id,
-                enabled = 1,
-                updated_at = datetime('now')
-            """,
-            (target_id, source_type, user_id, target_id),
+    state = load_state()
+    found = None
+    for conversation in state["conversations"]:
+        if conversation.get("conversation_id") == target_id:
+            found = conversation
+            break
+
+    if found:
+        found.update(
+            {
+                "source_type": source_type,
+                "user_id": user_id or found.get("user_id"),
+                "target_id": target_id,
+                "enabled": True,
+                "updated_at": now_text(),
+            }
         )
+    else:
+        state["conversations"].append(
+            {
+                "conversation_id": target_id,
+                "source_type": source_type,
+                "user_id": user_id,
+                "target_id": target_id,
+                "enabled": True,
+                "created_at": now_text(),
+                "updated_at": now_text(),
+            }
+        )
+    save_state(state)
     return target_id
 
 
 def get_push_targets() -> list[str]:
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT target_id FROM conversations
-            WHERE enabled = 1
-            ORDER BY source_type = 'group' DESC, updated_at DESC
-            """
-        ).fetchall()
-    return [row["target_id"] for row in rows]
+    state = load_state()
+    conversations = [
+        conv for conv in state["conversations"] if conv.get("enabled", True)
+    ]
+    conversations.sort(
+        key=lambda conv: (
+            0 if conv.get("source_type") == "group" else 1,
+            clean_text(conv.get("updated_at")),
+        )
+    )
+    return [clean_text(conv.get("target_id")) for conv in conversations if clean_text(conv.get("target_id"))]
 
 
 def save_message(conversation_id: str, role: str, content: str) -> None:
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)",
-            (conversation_id, role, content[:4000]),
-        )
-        conn.execute(
-            """
-            DELETE FROM messages
-            WHERE conversation_id = ?
-              AND id NOT IN (
-                SELECT id FROM messages
-                WHERE conversation_id = ?
-                ORDER BY id DESC
-                LIMIT 30
-              )
-            """,
-            (conversation_id, conversation_id),
-        )
+    state = load_state()
+    state["counters"]["message"] += 1
+    state["messages"].append(
+        {
+            "id": state["counters"]["message"],
+            "conversation_id": conversation_id,
+            "role": role,
+            "content": content[:4000],
+            "created_at": now_text(),
+        }
+    )
+
+    kept_messages = []
+    for message in state["messages"]:
+        same_conversation = message.get("conversation_id") == conversation_id
+        if not same_conversation:
+            kept_messages.append(message)
+            continue
+        recent_ids = [
+            item["id"]
+            for item in sorted(
+                [
+                    msg
+                    for msg in state["messages"]
+                    if msg.get("conversation_id") == conversation_id
+                ],
+                key=lambda msg: int(msg.get("id", 0)),
+                reverse=True,
+            )[:30]
+        ]
+        if message.get("id") in recent_ids:
+            kept_messages.append(message)
+    state["messages"] = kept_messages
+    save_state(state)
 
 
 def get_recent_messages(conversation_id: str, limit: int = 12) -> list[dict[str, str]]:
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT role, content FROM messages
-            WHERE conversation_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (conversation_id, limit),
-        ).fetchall()
+    state = load_state()
+    messages = [
+        msg for msg in state["messages"] if msg.get("conversation_id") == conversation_id
+    ]
+    messages.sort(key=lambda msg: int(msg.get("id", 0)))
     return [
-        {"role": row["role"], "content": row["content"]}
-        for row in reversed(rows)
+        {"role": clean_text(msg.get("role")), "content": clean_text(msg.get("content"))}
+        for msg in messages[-limit:]
     ]
 
 
@@ -372,66 +489,57 @@ def create_pending_action(
     action_type: str,
     payload: dict[str, Any],
 ) -> None:
-    with db() as conn:
-        conn.execute(
-            """
-            UPDATE pending_actions
-            SET status = 'superseded', updated_at = datetime('now')
-            WHERE conversation_id = ? AND action_type = ? AND status = 'pending'
-            """,
-            (conversation_id, action_type),
-        )
-        conn.execute(
-            """
-            INSERT INTO pending_actions (conversation_id, action_type, payload)
-            VALUES (?, ?, ?)
-            """,
-            (conversation_id, action_type, json.dumps(payload, ensure_ascii=False)),
-        )
+    state = load_state()
+    for action in state["pending_actions"]:
+        if (
+            action.get("conversation_id") == conversation_id
+            and action.get("action_type") == action_type
+            and action.get("status") == "pending"
+        ):
+            action["status"] = "superseded"
+            action["updated_at"] = now_text()
+
+    state["counters"]["pending_action"] += 1
+    state["pending_actions"].append(
+        {
+            "id": state["counters"]["pending_action"],
+            "conversation_id": conversation_id,
+            "action_type": action_type,
+            "payload": payload,
+            "status": "pending",
+            "created_at": now_text(),
+            "updated_at": now_text(),
+        }
+    )
+    save_state(state)
 
 
 def get_pending_action(
     conversation_id: str,
     action_type: str | None = None,
 ) -> dict[str, Any] | None:
-    params: list[Any] = [conversation_id]
-    type_clause = ""
-    if action_type:
-        type_clause = "AND action_type = ?"
-        params.append(action_type)
-    with db() as conn:
-        row = conn.execute(
-            f"""
-            SELECT id, action_type, payload FROM pending_actions
-            WHERE conversation_id = ? {type_clause} AND status = 'pending'
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            params,
-        ).fetchone()
-    if not row:
+    state = load_state()
+    actions = [
+        action
+        for action in state["pending_actions"]
+        if action.get("conversation_id") == conversation_id
+        and action.get("status") == "pending"
+        and (action_type is None or action.get("action_type") == action_type)
+    ]
+    if not actions:
         return None
-    return {
-        "id": row["id"],
-        "action_type": row["action_type"],
-        "payload": json.loads(row["payload"]),
-    }
+    actions.sort(key=lambda action: int(action.get("id", 0)), reverse=True)
+    return copy.deepcopy(actions[0])
 
 
 def finish_pending_action(action_id: int, status: str = "done") -> None:
-    with db() as conn:
-        conn.execute(
-            """
-            UPDATE pending_actions
-            SET status = ?, updated_at = datetime('now')
-            WHERE id = ?
-            """,
-            (status, action_id),
-        )
-
-
-def clean_text(value: Any) -> str:
-    return str(value or "").strip()
+    state = load_state()
+    for action in state["pending_actions"]:
+        if int(action.get("id", 0)) == int(action_id):
+            action["status"] = status
+            action["updated_at"] = now_text()
+            break
+    save_state(state)
 
 
 def require_openai() -> OpenAI:
@@ -461,19 +569,16 @@ def context_summary(conversation_id: str | None = None) -> str:
 
     history_text = ""
     if conversation_id:
-        with db() as conn:
-            rows = conn.execute(
-                """
-                SELECT meal_date, title FROM meal_history
-                WHERE conversation_id = ?
-                ORDER BY id DESC
-                LIMIT 7
-                """,
-                (conversation_id,),
-            ).fetchall()
+        state = load_state()
+        rows = [
+            row
+            for row in state["meal_history"]
+            if row.get("conversation_id") == conversation_id
+        ]
+        rows.sort(key=lambda row: int(row.get("id", 0)), reverse=True)
         if rows:
             history_text = "\n最近作った献立:\n" + "\n".join(
-                f"- {row['meal_date']}: {row['title']}" for row in rows
+                f"- {row.get('meal_date')}: {row.get('title')}" for row in rows[:14]
             )
 
     return f"""現在の在庫:
@@ -593,6 +698,9 @@ def generate_meal_options(
 - 調理器具はフライパン、鍋、炊飯器、電子レンジ、IH一口。
 - 予算は2人分で理想1000円、許容1500円。LIFEのスーパーで買いやすい材料を優先。
 - 今ある在庫を優先し、不足があれば買い足しを明記。
+- 同じ料理名は30日以内に出さない。
+- 似た主菜や同じ味付けは14日以内に避ける。
+- 同じ主たんぱく質を2日連続にしない。
 
 必ず JSON だけで返してください。
 形式:
@@ -665,7 +773,11 @@ def format_meal_options(payload: dict[str, Any]) -> str:
                 "作り方:",
             ]
         )
-        lines.extend(f"{idx}. {clean_text(step)}" for idx, step in enumerate(steps, 1) if clean_text(step))
+        lines.extend(
+            f"{idx}. {clean_text(step)}"
+            for idx, step in enumerate(steps, 1)
+            if clean_text(step)
+        )
         lines.append("")
     lines.append("作るものが決まったら A / B / C で返してください。")
     return "\n".join(lines).strip()
@@ -730,7 +842,11 @@ def format_single_recipe(option: dict[str, Any]) -> str:
         f"買い足し: {as_list_text(option.get('ingredients_to_buy')) or '買い足しなし'}",
         "作り方:",
     ]
-    lines.extend(f"{idx}. {clean_text(step)}" for idx, step in enumerate(steps, 1) if clean_text(step))
+    lines.extend(
+        f"{idx}. {clean_text(step)}"
+        for idx, step in enumerate(steps, 1)
+        if clean_text(step)
+    )
     return "\n".join(lines)
 
 
@@ -740,20 +856,19 @@ def mark_selected_meal_cooked(conversation_id: str) -> str:
         return "作った献立がまだ選ばれていません。先に A / B / C で選んでください。"
 
     option = pending["payload"]
-    today = datetime.now(JST).strftime("%Y-%m-%d")
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO meal_history (conversation_id, meal_date, title, details)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                conversation_id,
-                today,
-                clean_text(option.get("title")),
-                json.dumps(option, ensure_ascii=False),
-            ),
-        )
+    state = load_state()
+    state["counters"]["meal_history"] += 1
+    state["meal_history"].append(
+        {
+            "id": state["counters"]["meal_history"],
+            "conversation_id": conversation_id,
+            "meal_date": datetime.now(JST).strftime("%Y-%m-%d"),
+            "title": clean_text(option.get("title")),
+            "details": option,
+            "created_at": now_text(),
+        }
+    )
+    save_state(state)
 
     updated_inventory, note = reconcile_inventory_after_cooking(
         get_inventory(),
@@ -1087,10 +1202,6 @@ def send_daily_suggestions() -> dict[str, Any]:
     return {"sent": sent, "targets": targets, "errors": errors}
 
 
-def now_text() -> str:
-    return datetime.now(JST).isoformat(timespec="seconds")
-
-
 def scheduler_loop() -> None:
     last_run_date = ""
     while True:
@@ -1133,6 +1244,10 @@ def health() -> Any:
             "line_access_token_configured": bool(LINE_CHANNEL_ACCESS_TOKEN),
             "line_secret_configured": bool(LINE_CHANNEL_SECRET),
             "openai_configured": bool(OPENAI_API_KEY),
+            "storage_backend": STORAGE_BACKEND,
+            "supabase_configured": USE_SUPABASE,
+            "storage_ready": not bool(storage_init_error),
+            "storage_error": storage_init_error,
             "schedule": f"{SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} Asia/Tokyo",
         }
     )
@@ -1147,7 +1262,7 @@ def trigger_daily() -> Any:
     return jsonify(send_daily_suggestions())
 
 
-init_db()
+init_storage()
 
 if ENABLE_SCHEDULER:
     threading.Thread(target=scheduler_loop, daemon=True).start()

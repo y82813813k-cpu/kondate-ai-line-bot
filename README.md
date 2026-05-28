@@ -20,6 +20,9 @@ LINE_CHANNEL_SECRET=
 LINE_CHANNEL_ACCESS_TOKEN=
 OPENAI_MODEL=gpt-4o-mini
 OPENAI_VISION_MODEL=gpt-4o-mini
+SUPABASE_URL=
+SUPABASE_SERVICE_ROLE_KEY=
+SUPABASE_STATE_KEY=global
 DB_PATH=data/kondate_ai.sqlite3
 SCHEDULE_HOUR=8
 SCHEDULE_MINUTE=0
@@ -50,15 +53,22 @@ Set the same `TASK_SECRET` value in Render environment variables.
 
 ## Persistent data
 
-Render Free uses an ephemeral filesystem. The prototype will still work, but inventory and preferences can be lost when the service restarts or redeploys.
+Use Supabase Free to keep inventory, preferences, conversations, and meal history after Render Free restarts.
 
-For a paid Render service with a persistent disk, set:
+1. Create a Supabase project.
+2. Open SQL Editor.
+3. Run `supabase/schema.sql`.
+4. Open Project Settings > API.
+5. Copy `Project URL` to Render as `SUPABASE_URL`.
+6. Copy `service_role` key to Render as `SUPABASE_SERVICE_ROLE_KEY`.
+
+Keep the `service_role` key server-side only. Do not put it in browser code or commit it to GitHub.
+
+When Supabase variables are not set, the app falls back to local SQLite:
 
 ```env
-DB_PATH=/var/data/kondate_ai.sqlite3
+DB_PATH=data/kondate_ai.sqlite3
 ```
-
-Mount the disk at `/var/data`.
 
 ## LINE webhook
 
