@@ -27,6 +27,24 @@ ENABLE_SCHEDULER=true
 PORT=5000
 ```
 
+For Render with a persistent disk, set:
+
+```env
+DB_PATH=/var/data/kondate_ai.sqlite3
+```
+
+Mount the disk at `/var/data`.
+
+## Render deploy settings
+
+- Service type: Web Service
+- Runtime: Python 3
+- Build command: `pip install -r requirements.txt`
+- Start command: `gunicorn --workers 1 --bind 0.0.0.0:$PORT app:app`
+- Instance type: Starter or higher is recommended for reliable 08:00 delivery
+
+Free web services can spin down after inactivity, so the in-process scheduler might not run at exactly 08:00 if the service is asleep.
+
 ## LINE webhook
 
 After deployment, set the LINE Developers webhook URL to:
