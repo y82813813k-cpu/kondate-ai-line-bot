@@ -1,9 +1,6 @@
 name: Daily dinner suggestion
 
 on:
-  schedule:
-    # 08:00 JST is 23:00 UTC on the previous day.
-    - cron: "0 23 * * *"
   workflow_dispatch:
 
 jobs:
